@@ -1,0 +1,383 @@
+import pandas as pd
+from google.colab import files
+
+# Upload file
+uploaded = files.upload()
+
+# Get filename (first uploaded file)
+filename = list(uploaded.keys())[0]
+
+# Read CSV directly
+df = pd.read_csv(filename)
+
+print("✅ File loaded successfully!")
+print(df.head())
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from prophet import Prophet
+
+# For Colab upload
+try:
+    from google.colab import files
+    uploaded = files.upload()
+    filename = list(uploaded.keys())[0]
+except Exception:
+    # If not Colab, set filename manually or ensure file is in working dir
+    filename = "demand_forecasting.csv"
+    print("Using filename:", filename)
+
+# 1) Load csv
+df = pd.read_csv(filename, low_memory=False)
+print("Raw columns:", df.columns.tolist())
+
+# 2) Normalize column names (strip spaces, lower-case)
+df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+print("Normalized columns:", df.columns.tolist())
+
+# 3) Auto-detect date & sales columns
+def find_date_col(cols):
+    for c in cols:
+        if 'date' in c:
+            return c
+    return None
+
+def find_sales_col(cols):
+    candidates = ['sales','sales_quantity','sales_qty','quantity','units_sold','units']
+    for c in cols:
+        for k in candidates:
+            if k in c:
+                return c
+    # fallback: any column that looks numeric and contains 'sale' substring
+    for c in cols:
+        if 'sale' in c and pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return None
+
+date_col = find_date_col(df.columns)
+sales_col = find_sales_col(df.columns)
+
+if date_col is None or sales_col is None:
+    raise ValueError(f"Couldn't auto-detect date or sales column. Detected: date_col={date_col}, sales_col={sales_col}."
+                     " Rename your columns or tell me which columns to use.")
+
+print("Using date column:", date_col)
+print("Using sales column:", sales_col)
+
+# 4) Optional: detect product/store columns (for per-product forecasts)
+product_col = None
+store_col = None
+for c in df.columns:
+    if 'product' in c and 'id' in c:
+        product_col = c
+        break
+if not product_col:
+    for c in df.columns:
+        if c in ('product','sku'):
+            product_col = c
+            break
+
+for c in df.columns:
+    if 'store' in c and 'id' in c:
+        store_col = c
+        break
+if not store_col:
+    for c in df.columns:
+        if c in ('store','store_id','branch'):
+            store_col = c
+            break
+
+print("product_col:", product_col, "store_col:", store_col)
+
+# 5) Preprocess date & sales
+df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+df = df.dropna(subset=[date_col])
+df[sales_col] = pd.to_numeric(df[sales_col], errors='coerce').fillna(0)
+
+# 6) Normalize promotions / boolean-like columns & create dummies for low-cardinality categoricals
+# We'll create regressors from numeric columns and from categorical columns with small cardinality.
+reserved = {date_col, sales_col, product_col, store_col}
+candidate_regs = []
+
+for c in df.columns:
+    if c in reserved or c is None:
+        continue
+    # If numeric -> keep as regressor
+    if pd.api.types.is_numeric_dtype(df[c]):
+        candidate_regs.append(c)
+    else:
+        # try to map typical Yes/No to 1/0
+        if df[c].dropna().isin(['Yes','No','yes','no','Y','N']).all():
+            df[c] = df[c].map(lambda x: 1 if str(x).lower().startswith('y') else 0)
+            candidate_regs.append(c)
+        # if categorical with low cardinality -> dummies
+        elif df[c].nunique() <= 10:
+            dummies = pd.get_dummies(df[c].astype(str), prefix=c, dummy_na=False)
+            df = pd.concat([df, dummies], axis=1)
+            candidate_regs.extend(dummies.columns.tolist())
+        # else ignore (free-text high-cardinality like "external_factors" might be noisy)
+        else:
+            # skip large cardinality text columns
+            pass
+
+# Remove any regressors that are identical to reserved
+candidate_regs = [c for c in candidate_regs if c not in reserved]
+
+print("Regressors to be used (automatically detected):", candidate_regs)
+
+# ---- Choose mode ----
+# 'aggregate' -> forecast total sales across all products/stores
+# 'per_sku'   -> forecast for a single product (and store if store_col exists)
+forecast_mode = "aggregate"   # change to "per_sku" to forecast an SKU
+product_to_forecast = None    # set a value (e.g., 4277) when forecast_mode == "per_sku"
+store_to_forecast = None      # optional (when forecast_mode == "per_sku")
+
+# If user didn't set product_to_forecast and per_sku selected, pick top-selling product automatically
+if forecast_mode == "per_sku":
+    if product_col is None:
+        raise ValueError("No product column detected; can't run 'per_sku' mode.")
+    if product_to_forecast is None:
+        top = df.groupby(product_col)[sales_col].sum().sort_values(ascending=False).index[0]
+        product_to_forecast = top
+        print("No product specified - auto-selected top product:", product_to_forecast)
+
+# 7) Prepare time-series (ds,y) and regressors
+if forecast_mode == "aggregate":
+    # Aggregate by date
+    agg_dict = {sales_col: 'sum'}
+    for r in candidate_regs:
+        agg_dict[r] = 'mean'   # reasonable default for numeric/dummy regressors
+    ts = df.groupby(date_col).agg(agg_dict).reset_index().rename(columns={date_col: 'ds', sales_col: 'y'})
+else:
+    # Filter selected product (+store if provided)
+    cond = df[product_col] == product_to_forecast
+    if store_col and store_to_forecast is not None:
+        cond = cond & (df[store_col] == store_to_forecast)
+    ts = df[cond].groupby(date_col).agg({sales_col: 'sum', **{r: 'mean' for r in candidate_regs}}).reset_index().rename(columns={date_col:'ds', sales_col:'y'})
+
+# Sort & fill missing dates (fill regressors with forward/backfill or zeros)
+ts = ts.sort_values('ds').reset_index(drop=True)
+
+# Infer frequency -- default to daily if unsure
+try:
+    freq = pd.infer_freq(ts['ds'])
+except Exception:
+    freq = None
+if freq is None:
+    freq = 'D'
+
+# reindex to continuous date range so Prophet has even spacing for regressors
+full_idx = pd.date_range(start=ts['ds'].min(), end=ts['ds'].max(), freq=freq)
+ts = ts.set_index('ds').reindex(full_idx).rename_axis('ds').reset_index()
+# y: fill missing with 0 (no sales)
+ts['y'] = ts['y'].fillna(0)
+# regressors: forward-fill then fill remaining NaNs with 0
+for r in candidate_regs:
+    if r in ts.columns:
+        ts[r] = ts[r].ffill().bfill().fillna(0)
+    else:
+        ts[r] = 0.0
+
+print("\nPrepared timeseries sample:")
+print(ts.head())
+
+# 8) Build & fit Prophet model with regressors
+m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+
+for r in candidate_regs:
+    m.add_regressor(r)
+
+# fit
+m.fit(ts[['ds','y'] + candidate_regs])
+
+# 9) Create future dataframe and populate regressors
+periods = 90   # forecast horizon (days)
+future = m.make_future_dataframe(periods=periods, freq=freq)
+
+# For regressors in the future, we will use the last observed value (a simple but common approach)
+last_values = ts[candidate_regs].iloc[-1].to_dict()
+for r in candidate_regs:
+    future[r] = last_values.get(r, 0)
+
+# 10) Predict
+forecast = m.predict(future)
+
+# 11) Plot results
+fig1 = m.plot(forecast)
+plt.title("Demand Forecast (Prophet)")
+plt.xlabel("Date")
+plt.ylabel("Sales")
+plt.show()
+
+fig2 = m.plot_components(forecast)
+plt.show()
+
+# 12) Save forecast
+out_cols = ['ds','yhat','yhat_lower','yhat_upper'] + candidate_regs
+forecast[out_cols].to_csv("forecast_output.csv", index=False)
+print("✅ Forecast saved to forecast_output.csv")
+
+# 13) If per-sku mode, also show summary
+if forecast_mode == "per_sku":
+    print(f"Forecast completed for product {product_to__forecast} (store: {store_to_forecast})")
+else:
+    print("Aggregate forecast completed.")
+
+
+# Install Prophet (only once)
+!pip install prophet --quiet
+
+import pandas as pd
+from prophet import Prophet
+import matplotlib.pyplot as plt
+from google.colab import files
+
+# 1) Upload dataset
+uploaded = files.upload()
+
+# 2) Load dataset
+filename = list(uploaded.keys())[0]
+df = pd.read_csv(filename)
+
+print("✅ Dataset loaded successfully!")
+print("📌 Columns found:", df.columns.tolist())
+print(df.head())
+
+# 3) Normalize column names (lowercase)
+df.columns = [c.lower() for c in df.columns]
+
+# Check available columns
+if "date" not in df.columns:
+    raise ValueError(f"No 'date' column found! Available columns: {df.columns.tolist()}")
+
+if "sales" not in df.columns:
+    raise ValueError(f"No 'sales' column found! Available columns: {df.columns.tolist()}")
+
+# 4) Fix date format (handles dd-mm-yyyy automatically)
+df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+
+# Drop invalid rows
+df = df.dropna(subset=["date", "sales"])
+
+# 5) Prepare data for Prophet
+prophet_df = df.rename(columns={"date": "ds", "sales": "y"})[["ds", "y"]]
+
+# 6) Fit Prophet model
+model = Prophet()
+model.fit(prophet_df)
+
+# 7) Make future predictions (next 180 days)
+future = model.make_future_dataframe(periods=180)
+forecast = model.predict(future)
+
+# 8) Plot forecast
+fig1 = model.plot(forecast)
+plt.show()
+
+# 9) Plot trend/seasonality components
+fig2 = model.plot_components(forecast)
+plt.show()
+
+# 10) Save forecast results
+forecast.to_csv("forecast_results.csv", index=False)
+print("📂 Forecast saved as forecast_results.csv")
+
+
+
+!pip install prophet --quiet
+
+import pandas as pd
+from prophet import Prophet
+import matplotlib.pyplot as plt
+from google.colab import files
+import os
+
+# 1) Upload dataset
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+
+# 2) Load dataset
+df = pd.read_csv(filename)
+print("✅ Dataset loaded successfully!")
+print("📌 Columns found:", df.columns.tolist())
+print(df.head())
+
+# 3) Normalize column names
+df.columns = [c.strip().lower() for c in df.columns]
+
+# 4) Check for required columns
+if "date" not in df.columns:
+    raise ValueError(f"No 'date' column found! Available columns: {df.columns.tolist()}")
+
+if "sales" not in df.columns:
+    raise ValueError(f"No 'sales' column found! Available columns: {df.columns.tolist()}")
+
+# 5) Fix date format
+df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+
+# Drop invalid rows
+df = df.dropna(subset=["date", "sales"])
+
+# 6) If multiple categories exist (e.g., product, region), handle separately
+category_col = None
+for col in df.columns:
+    if col not in ["date", "sales"] and df[col].nunique() > 1:
+        category_col = col
+        print(f"📌 Found category column: {category_col}")
+        break
+
+# Create results folder
+os.makedirs("forecast_results", exist_ok=True)
+
+if category_col:
+    categories = df[category_col].unique()
+else:
+    categories = ["all"]
+
+# 7) Forecast for each category
+for cat in categories:
+    if category_col:
+        temp_df = df[df[category_col] == cat].copy()
+    else:
+        temp_df = df.copy()
+
+    # Prepare Prophet data
+    prophet_df = temp_df.rename(columns={"date": "ds", "sales": "y"})[["ds", "y"]]
+
+    # Fit model
+    model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        seasonality_mode="multiplicative"  # advanced setting
+    )
+    model.fit(prophet_df)
+
+    # Future predictions
+    future = model.make_future_dataframe(periods=180)
+    forecast = model.predict(future)
+
+    # Save forecast
+    save_name = f"forecast_{cat}.csv" if category_col else "forecast_all.csv"
+    forecast.to_csv(os.path.join("forecast_results", save_name), index=False)
+
+    # Plot forecast
+    fig1 = model.plot(forecast)
+    plt.title(f"Sales Forecast - {cat}", fontsize=14)
+    plt.xlabel("Date")
+    plt.ylabel("Sales")
+    plt.grid(True)
+    plt.savefig(os.path.join("forecast_results", f"forecast_plot_{cat}.png"))
+    plt.show()
+
+    # Plot trend/seasonality
+    fig2 = model.plot_components(forecast)
+    plt.savefig(os.path.join("forecast_results", f"components_{cat}.png"))
+    plt.show()
+
+    print(f"✅ Forecast for {cat} saved in 'forecast_results/'")
+
+print("📂 All forecasts & plots saved in 'forecast_results/' folder")
+
+
